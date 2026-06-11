@@ -107,6 +107,12 @@ class SelectionPipeline:
                 self._data["signal_dates"] = pd.DatetimeIndex(
                     self.aggregated_market_data.index.get_level_values(Col.DATE).unique()
                 ).sort_values()
+        # if self._requires_alpha158_data() and hasattr(self._loader, "load_alpha158_data"):
+        #     self._data["alpha158"] = self._loader.load_alpha158_data(symbols, start, end)
+        if start is not None and hasattr(self._loader, "load_predata"):
+            logger.info("加载预热数据...")
+            predata = self._loader.load_predata(symbols, start, end)
+            self._data = self._prepend_predata(self._data, predata)
 
         for table_name, table_data in self._data.items():
             logger.info("{} 数据: {} 行", table_name, len(table_data))
@@ -115,6 +121,31 @@ class SelectionPipeline:
     # ------------------------------------------------------------------ #
     #  执行
     # ------------------------------------------------------------------ #
+
+    def _requires_alpha158_data(self) -> bool:
+        names = set(self._factor_names)
+        names.update(factor.name for factor in self._factor_instances)
+        return "svm_alpha158" in names
+
+    @staticmethod
+    def _prepend_predata(
+        data: dict[str, pd.DataFrame],
+        predata: dict[str, pd.DataFrame],
+    ) -> dict[str, pd.DataFrame]:
+        merged_data = dict(data)
+        for table_name, table_data in predata.items():
+            if table_name == "signal_dates" or not isinstance(table_data, pd.DataFrame) or table_data.empty:
+                continue
+
+            current_data = merged_data.get(table_name)
+            if isinstance(current_data, pd.DataFrame) and not current_data.empty:
+                combined = pd.concat([table_data, current_data]).sort_index()
+                if combined.index.has_duplicates:
+                    combined = combined[~combined.index.duplicated(keep="last")]
+                merged_data[table_name] = combined
+            else:
+                merged_data[table_name] = table_data
+        return merged_data
 
     def run(
         self,

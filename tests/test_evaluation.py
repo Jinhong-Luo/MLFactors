@@ -475,16 +475,19 @@ class TestLayeredBacktest:
 class TestFactorReport:
     def test_summary_returns_dataframe(self):
         from evaluation.selection.report import FactorReport
-        from factors.registry import FactorRegistry
-        FactorRegistry.reset()
 
         mkt = make_market_df(n_dates=60, n_symbols=20)
-        cls = FactorRegistry.get("momentum_5")
-        factor_vals = cls().generate_signals(mkt).stack().dropna()
+        dates = pd.DatetimeIndex(mkt.index.get_level_values(Col.DATE).unique())
+        factor_vals = pd.Series(
+            np.tile(np.arange(20, dtype=float), len(dates)),
+            index=mkt.index,
+            name="test_factor",
+        )
 
         report = FactorReport(
             factor_values=factor_vals,
             market_data=mkt,
+            signal_dates=dates,
             n_groups=5,
         )
         summary = report.summary()
@@ -492,6 +495,10 @@ class TestFactorReport:
         assert set(summary.index) == {1}
         assert "IC_mean" in summary.columns
         assert "ICIR" in summary.columns
+        assert "long_sharpe" in summary.columns
+        assert summary.loc[1, "long_sharpe"] == pytest.approx(
+            round(report.layered().sharpe_ratios.loc[5], 4)
+        )
 
     def test_to_dict(self):
         from evaluation.selection.report import FactorReport

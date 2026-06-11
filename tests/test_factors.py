@@ -8,6 +8,7 @@ import pytest
 
 from data.schema import Col, FundamentalCol
 from factors.base import BaseFactor
+from factors.library.selection.capm_beta import CapmBeta
 from factors.registry import FactorRegistry, register_factor
 
 
@@ -231,3 +232,93 @@ class TestBuiltinFactors:
         result = cls().generate_signals(mkt, fundamental).stack().dropna()
         assert result.__len__() > 0
         assert (result >= 0).all()
+
+
+class TestCapmBeta:
+    def _data_from_returns(
+        self,
+        returns: pd.DataFrame,
+        anchor_cap: float = 1e12,
+    ) -> dict[str, pd.DataFrame]:
+        close = 100.0 * (1.0 + returns.fillna(0.0)).cumprod()
+        close.index.name = Col.DATE
+        close.columns.name = Col.SYMBOL
+        market = close.stack().rename(Col.CLOSE).to_frame()
+        market.index.names = [Col.DATE, Col.SYMBOL]
+
+        market_cap = pd.DataFrame(1.0, index=close.index, columns=close.columns)
+        if "MARKET" in market_cap.columns:
+            market_cap["MARKET"] = anchor_cap
+        market_cap.index.name = Col.DATE
+        market_cap.columns.name = Col.SYMBOL
+        fundamental = market_cap.stack().rename("market_cap").to_frame()
+        fundamental.index.names = [Col.DATE, Col.SYMBOL]
+        return {"market": market, "fundamental": fundamental}
+
+    def test_beta_matches_known_slopes(self):
+        dates = pd.date_range("2023-01-02", periods=320, freq="B")
+        rng = np.random.default_rng(7)
+        market_ret = pd.Series(rng.normal(0.0003, 0.01, len(dates)), index=dates)
+        noise = rng.normal(0.0, 0.0005, (len(dates), 2))
+        stock_ret = pd.DataFrame(
+            {
+                "BETA2": 2.0 * market_ret.to_numpy() + noise[:, 0],
+                "BETA05": 0.5 * market_ret.to_numpy() + noise[:, 1],
+                "MARKET": market_ret.to_numpy(),
+            },
+            index=dates,
+        )
+        data = self._data_from_returns(stock_ret)
+
+        result = CapmBeta(lookback=252, min_obs=120, clip=(-10, 10), rebalance="daily").generate_signals(
+            data
+        )
+
+        assert result.iloc[-1]["BETA2"] == pytest.approx(2.0, abs=0.05)
+        assert result.iloc[-1]["BETA05"] == pytest.approx(0.5, abs=0.05)
+
+    def test_zero_market_variance_returns_nan(self):
+        dates = pd.date_range("2024-01-02", periods=40, freq="B")
+        stock_ret = pd.DataFrame(
+            {
+                "AAA": np.linspace(-0.01, 0.01, len(dates)),
+                "MARKET": 0.0,
+            },
+            index=dates,
+        )
+        data = self._data_from_returns(stock_ret)
+        fundamental = data["fundamental"].copy()
+        idx = fundamental.index.get_level_values(Col.SYMBOL) == "AAA"
+        fundamental.loc[idx, "market_cap"] = 0.0
+        data["fundamental"] = fundamental
+
+        result = CapmBeta(lookback=20, min_obs=10, rebalance="daily").generate_signals(
+            data
+        )
+
+        assert result["AAA"].dropna().empty
+
+    def test_insufficient_observations_return_nan(self):
+        dates = pd.date_range("2024-01-02", periods=20, freq="B")
+        base_ret = pd.Series(np.linspace(-0.01, 0.01, len(dates)), index=dates)
+        stock_ret = pd.DataFrame({"AAA": 1.5 * base_ret}, index=dates)
+        data = self._data_from_returns(stock_ret)
+
+        result = CapmBeta(lookback=20, min_obs=30, rebalance="daily").generate_signals(
+            data
+        )
+
+        assert result["AAA"].dropna().empty
+
+    def test_monthly_returns_last_trading_day_per_month(self):
+        dates = pd.date_range("2024-01-02", periods=65, freq="B")
+        base_ret = pd.Series(np.linspace(-0.01, 0.01, len(dates)), index=dates)
+        stock_ret = pd.DataFrame({"AAA": 1.2 * base_ret}, index=dates)
+        data = self._data_from_returns(stock_ret)
+
+        result = CapmBeta(lookback=10, min_obs=5, rebalance="monthly").generate_signals(
+            data
+        )
+
+        expected_dates = dates.to_series().groupby(dates.to_period("M")).tail(1).to_list()
+        assert result.index.to_list() == expected_dates

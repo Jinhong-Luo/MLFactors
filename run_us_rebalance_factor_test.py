@@ -48,12 +48,12 @@ from factors.registry import FactorRegistry
 from pipeline.selection_runner import SelectionPipeline
 
 
-DEFAULT_FACTORS = ["vff3"]
+DEFAULT_FACTORS = ["quality_combine_equal_weight"]
 DEFAULT_DB_PATH = ROOT / "cache/us.db"
-DEFAULT_START_DATE = "2017-01-03"
+DEFAULT_START_DATE = "2018-01-04"
 DEFAULT_END_DATE = "2026-05-28"
-DEFAULT_REBALANCE = "month"
-DEFAULT_OUTPUT_DIR = Path("outputs/us_rebalance_vff3_month")
+DEFAULT_REBALANCE = "week"
+DEFAULT_OUTPUT_DIR = Path("outputs/us_rebalance_quality_combine_equal_weight_week_fixIndustry_sp500")
 REBALANCE_LABELS = {
     "week": "1w",
     "half_month": "1half_month",
@@ -212,6 +212,9 @@ def summarize_report(report, periods_per_year: int) -> dict[str, float]:
     df = len(ic_s.dropna()) - 1
     p_value = stats.t.sf(abs(t_stat), df) * 2 if df > 0 else float("nan")
     layered = report.layered()
+    long_sharpe = 0.0
+    if not layered.sharpe_ratios.empty:
+        long_sharpe = float(layered.sharpe_ratios.loc[layered.sharpe_ratios.index.max()])
 
     return {
         "period_bars": 1,
@@ -222,12 +225,90 @@ def summarize_report(report, periods_per_year: int) -> dict[str, float]:
         "p_value": round(float(p_value), 6),
         "IC>0_ratio": round(float((ic_s > 0).mean()), 4),
         "turnover": round(float(report.turnover().mean()), 4),
+        "long_sharpe": round(long_sharpe, 4),
         "long_max_drawdown": round(float(layered.long_max_drawdown), 4),
         "short_max_drawdown": round(float(layered.short_max_drawdown), 4),
         "top_excess_annual": round(float(layered.top_excess_annual), 4),
         "top_excess_max_dd": round(float(layered.top_excess_max_drawdown), 4),
         "top_excess_calmar": round(float(layered.top_excess_calmar), 4),
     }
+
+
+def _format_markdown_value(value: object) -> str:
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    text = str(value)
+    return text.replace("|", "\\|").replace("\n", "<br>")
+
+
+def dataframe_to_markdown(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "无数据\n"
+
+    table = df.reset_index(drop=True).copy()
+    columns = [str(col) for col in table.columns]
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join(["---"] * len(columns)) + " |",
+    ]
+    for _, row in table.iterrows():
+        lines.append("| " + " | ".join(_format_markdown_value(row[col]) for col in table.columns) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def save_markdown_report(
+    reports: dict,
+    output_dir: Path,
+    summary: pd.DataFrame,
+    yearly_ic: pd.DataFrame,
+    plot_paths: dict[str, Path],
+    period_label: str,
+    rebalance: str,
+) -> None:
+    report_path = output_dir / "report.md"
+    lines = [
+        "# 美股调仓周期因子报告",
+        "",
+        f"- 调仓周期: `{rebalance}`",
+        f"- 收益周期: `{period_label}`",
+        f"- 因子数: {len(reports)}",
+        "",
+        "## 汇总结果",
+        "",
+        dataframe_to_markdown(summary),
+        "## 分年度 IC",
+        "",
+        dataframe_to_markdown(yearly_ic),
+        "## 图表",
+        "",
+    ]
+
+    if plot_paths:
+        for factor_name, plot_path in plot_paths.items():
+            lines.extend([
+                f"### {factor_name}",
+                "",
+                f"![{factor_name}]({plot_path.name})",
+                "",
+            ])
+    else:
+        lines.extend(["未生成图表。", ""])
+
+    lines.extend(["## 每次调仓股票列表", ""])
+    for factor_name, report in reports.items():
+        holdings = report.rebalance_holdings().copy()
+        if not holdings.empty:
+            holdings.insert(0, "factor", factor_name)
+        lines.extend([
+            f"### {factor_name}",
+            "",
+            dataframe_to_markdown(holdings),
+        ])
+
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("Markdown 报告已保存: {}", report_path)
 
 
 def save_reports(
@@ -242,6 +323,7 @@ def save_reports(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     rows = []
+    plot_paths: dict[str, Path] = {}
     for name, report in reports.items():
         summary_df = pd.DataFrame([summarize_report(report, periods_per_year)])
         summary_df.insert(0, "factor", name)
@@ -267,6 +349,7 @@ def save_reports(
             save_path = output_dir / f"{name}_{period_label}_report.png"
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
             plt.close(fig)
+            plot_paths[name] = save_path
             logger.info("图表已保存: {}", save_path)
 
     summary = pd.concat(rows)
@@ -278,6 +361,16 @@ def save_reports(
     yearly_ic_path = output_dir / "yearly_ic.csv"
     yearly_ic.to_csv(yearly_ic_path, index=False)
     logger.info("分年度 IC 表已保存: {}", yearly_ic_path)
+
+    save_markdown_report(
+        reports=reports,
+        output_dir=output_dir,
+        summary=summary,
+        yearly_ic=yearly_ic,
+        plot_paths=plot_paths,
+        period_label=period_label,
+        rebalance=rebalance,
+    )
 
     print("\n" + "=" * 55)
     print("  美股调仓周期因子汇总")

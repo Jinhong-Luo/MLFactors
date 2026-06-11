@@ -7,6 +7,10 @@ from . import (
     alpha158_kline,
     alpha158_price,
     alpha158_rolling,
+    capm_beta,
     ordinal_factor_rotation,
+    quality_combine,
+    quality_growth,
+    svm_alpha158,
     volatility,
 )  # noqa: F401

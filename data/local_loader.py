@@ -299,10 +299,14 @@ class USStockLocalLoader(DataLoader):
     - ``fundamental``: 估值快照，字段 symbol/dt/market_cap/pe_ratio/pb_ratio/...
     - ``statement``  : 季度财报，字段 symbol/report_date/filing_date/revenue/net_income/...
     - ``macro``      : 宏观时间序列，字段 series_id/dt/observation_date/value/...
+    - ``sp500_constituents``: S&P 500 成分股时间表，字段 symbol/dt/updated_at
+    - ``industry``  : 股票行业分类映射，字段 symbol/name/sector/sub_industry/sector_etf
 
     Parameters
     ----------
     db_path : SQLite 数据库文件路径。
+    market : 市场标识。
+    filter_sp500_constituents : 兼容旧参数；当前加载流程不再用该表过滤数据。
     """
 
     _FUND_COL_MAP: dict[str, str] = {
@@ -320,7 +324,11 @@ class USStockLocalLoader(DataLoader):
 
     _TEMPORARILY_BLOCKED_SYMBOLS: tuple[str, ...] = ("XAUUSD",)
 
-    def __init__(self, db_path: str | Path, market: str = "US") -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        market: str = "US"
+    ) -> None:
         self.db_path = Path(db_path).expanduser().resolve()
         self.market = market
         if not self.db_path.exists():
@@ -340,6 +348,14 @@ class USStockLocalLoader(DataLoader):
         return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
     @staticmethod
+    def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
     def _date_bounds(
         column: str,
         start: str | date | None,
@@ -354,6 +370,66 @@ class USStockLocalLoader(DataLoader):
             conditions.append(f"date({column}) <= ?")
             params.append(str(pd.Timestamp(end).date()))
         return conditions, params
+
+    @staticmethod
+    def _preload_start(
+        start: str | date | None,
+        earliest: str | date | None,
+    ) -> pd.Timestamp | None:
+        if start is None:
+            return None
+        preload_start = pd.Timestamp(start).normalize() - pd.DateOffset(years=1)
+        if earliest is None:
+            return preload_start
+        earliest_date = pd.Timestamp(earliest).normalize()
+        return max(preload_start, earliest_date)
+
+    @staticmethod
+    def _preload_end(start: str | date | None) -> pd.Timestamp | None:
+        if start is None:
+            return None
+        return pd.Timestamp(start).normalize() - pd.Timedelta(days=1)
+
+    @staticmethod
+    def _valid_preload_range(
+        start: pd.Timestamp | None,
+        end: pd.Timestamp | None,
+    ) -> bool:
+        return start is not None and end is not None and start <= end
+
+    def _min_table_date(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        date_expr: str,
+        symbols: list[str] | None = None,
+        exclude_symbols: tuple[str, ...] = (),
+        extra_conditions: list[str] | None = None,
+    ) -> pd.Timestamp | None:
+        if not self._table_exists(conn, table):
+            return None
+
+        conditions: list[str] = []
+        params: list = []
+        if symbols:
+            placeholders = ",".join("?" * len(symbols))
+            conditions.append(f"t.symbol IN ({placeholders})")
+            params.extend(symbols)
+        if exclude_symbols:
+            placeholders = ",".join("?" * len(exclude_symbols))
+            conditions.append(f"t.symbol NOT IN ({placeholders})")
+            params.extend(exclude_symbols)
+        if extra_conditions:
+            conditions.extend(extra_conditions)
+
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        row = conn.execute(
+            f"SELECT MIN({date_expr}) AS min_date FROM {table} t{where}",
+            params,
+        ).fetchone()
+        if row is None or row["min_date"] is None:
+            return None
+        return pd.Timestamp(row["min_date"])
 
     # ------------------------------------------------------------------ #
     #  行情数据
@@ -411,23 +487,23 @@ class USStockLocalLoader(DataLoader):
 
         if symbols:
             placeholders = ",".join("?" * len(symbols))
-            conditions.append(f"symbol IN ({placeholders})")
+            conditions.append(f"t.symbol IN ({placeholders})")
             params.extend(symbols)
         if exclude_symbols:
             placeholders = ",".join("?" * len(exclude_symbols))
-            conditions.append(f"symbol NOT IN ({placeholders})")
+            conditions.append(f"t.symbol NOT IN ({placeholders})")
             params.extend(exclude_symbols)
         if start is not None:
-            conditions.append("date(dt) >= ?")
+            conditions.append("date(t.dt) >= ?")
             params.append(str(pd.Timestamp(start).date()))
         if end is not None:
-            conditions.append("date(dt) <= ?")
+            conditions.append("date(t.dt) <= ?")
             params.append(str(pd.Timestamp(end).date()))
 
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         query = (
-            "SELECT symbol, dt, open, high, low, close, volume"
-            f" FROM {table}{where} ORDER BY dt, symbol"
+            "SELECT t.symbol, t.dt, t.open, t.high, t.low, t.close, t.volume"
+            f" FROM {table} t{where} ORDER BY t.dt, t.symbol"
         )
 
         logger.debug("{} query: {}", log_name, query)
@@ -485,21 +561,21 @@ class USStockLocalLoader(DataLoader):
 
         if symbols:
             placeholders = ",".join("?" * len(symbols))
-            conditions.append(f"symbol IN ({placeholders})")
+            conditions.append(f"t.symbol IN ({placeholders})")
             params.extend(symbols)
         if self._TEMPORARILY_BLOCKED_SYMBOLS:
             placeholders = ",".join("?" * len(self._TEMPORARILY_BLOCKED_SYMBOLS))
-            conditions.append(f"symbol NOT IN ({placeholders})")
+            conditions.append(f"t.symbol NOT IN ({placeholders})")
             params.extend(self._TEMPORARILY_BLOCKED_SYMBOLS)
         if start is not None:
-            conditions.append("dt >= ?")
+            conditions.append("t.dt >= ?")
             params.append(str(pd.Timestamp(start).date()))
         if end is not None:
-            conditions.append("dt <= ?")
+            conditions.append("t.dt <= ?")
             params.append(str(pd.Timestamp(end).date()))
 
-        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         columns = self._table_columns(conn, table)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
         wanted = [
             "symbol",
             "dt",
@@ -515,20 +591,23 @@ class USStockLocalLoader(DataLoader):
             "current_ratio",
         ]
         selected = [column for column in wanted if column in columns]
-        query = f"SELECT {', '.join(selected)} FROM {table}{where} ORDER BY dt, symbol"
+        select_columns = ", ".join(f"t.{column}" for column in selected)
+        query = f"SELECT {select_columns} FROM {table} t{where} ORDER BY t.dt, t.symbol"
 
         logger.debug("USStockLocalLoader.load_fundamental_data query: {}", query)
         return pd.read_sql_query(query, conn, params=params)
 
-    def load_statement_data(
+    def load_alpha158_data(
         self,
         symbols: list[str] | None = None,
         start: str | date | None = None,
         end: str | date | None = None,
     ) -> pd.DataFrame:
-        """从 ``statement`` 表加载财报数据，以 filing_date 作为 date 索引。"""
+        """从 ``alpha158`` 表加载预计算 Alpha158 暴露。"""
+        table = "alpha158"
         conditions: list[str] = []
         params: list = []
+
         if symbols:
             placeholders = ",".join("?" * len(symbols))
             conditions.append(f"symbol IN ({placeholders})")
@@ -537,25 +616,73 @@ class USStockLocalLoader(DataLoader):
             placeholders = ",".join("?" * len(self._TEMPORARILY_BLOCKED_SYMBOLS))
             conditions.append(f"symbol NOT IN ({placeholders})")
             params.extend(self._TEMPORARILY_BLOCKED_SYMBOLS)
-        conditions.append("filing_date IS NOT NULL")
-        date_conditions, date_params = self._date_bounds("filing_date", start, end)
-        conditions.extend(date_conditions)
-        params.extend(date_params)
+        if start is not None:
+            conditions.append("date(dt) >= ?")
+            params.append(str(pd.Timestamp(start).date()))
+        if end is not None:
+            conditions.append("date(dt) <= ?")
+            params.append(str(pd.Timestamp(end).date()))
 
         where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-        query = (
-            "SELECT *, filing_date AS date "
-            f"FROM statement{where} ORDER BY date, symbol"
-        )
-        logger.debug("USStockLocalLoader.load_statement_data query: {}", query)
         with self._connect() as conn:
+            table_info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            alpha_columns = [row["name"] for row in table_info if row["name"].startswith("alpha158_")]
+            if not alpha_columns:
+                logger.warning("alpha158 表中未找到 alpha158_ 因子列")
+                return pd.DataFrame()
+            selected = ["symbol", "dt", *alpha_columns]
+            query = f"SELECT {', '.join(selected)} FROM {table}{where} ORDER BY dt, symbol"
+            logger.debug("USStockLocalLoader.load_alpha158_data query: {}", query)
             df = pd.read_sql_query(query, conn, params=params)
 
         if df.empty:
             return pd.DataFrame()
 
+        df = df.rename(columns={"dt": Col.DATE})
         df[Col.DATE] = pd.to_datetime(df[Col.DATE])
         df[Col.SYMBOL] = df[Col.SYMBOL].astype(str)
+        return self._set_index(df)
+
+    def load_statement_data(
+        self,
+        symbols: list[str] | None = None,
+        start: str | date | None = None,
+        end: str | date | None = None,
+    ) -> pd.DataFrame:
+        """从 ``statement`` 表加载财报数据，以 filing_date 延后 45 天作为 date 索引。"""
+        conditions: list[str] = []
+        params: list = []
+        statement_delay = pd.Timedelta(days=45)
+        if symbols:
+            placeholders = ",".join("?" * len(symbols))
+            conditions.append(f"t.symbol IN ({placeholders})")
+            params.extend(symbols)
+        if self._TEMPORARILY_BLOCKED_SYMBOLS:
+            placeholders = ",".join("?" * len(self._TEMPORARILY_BLOCKED_SYMBOLS))
+            conditions.append(f"t.symbol NOT IN ({placeholders})")
+            params.extend(self._TEMPORARILY_BLOCKED_SYMBOLS)
+        conditions.append("t.filing_date IS NOT NULL")
+        raw_start = pd.Timestamp(start) - statement_delay if start is not None else None
+        raw_end = pd.Timestamp(end) - statement_delay if end is not None else None
+        date_conditions, date_params = self._date_bounds("t.filing_date", raw_start, raw_end)
+        conditions.extend(date_conditions)
+        params.extend(date_params)
+
+        with self._connect() as conn:
+            where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+            query = (
+                "SELECT t.*, t.filing_date AS date "
+                f"FROM statement t{where} ORDER BY date, t.symbol"
+            )
+            logger.debug("USStockLocalLoader.load_statement_data query: {}", query)
+            df = pd.read_sql_query(query, conn, params=params)
+
+        if df.empty:
+            return pd.DataFrame()
+
+        df[Col.DATE] = pd.to_datetime(df[Col.DATE]) + statement_delay
+        df[Col.SYMBOL] = df[Col.SYMBOL].astype(str)
+        df = self._filter(df, symbols, start, end)
         return self._set_index(df)
 
     def load_macro_data(
@@ -582,6 +709,70 @@ class USStockLocalLoader(DataLoader):
         df["series_id"] = df["series_id"].astype(str)
         return df.set_index([Col.DATE, "series_id"]).sort_index()
 
+    def load_sp500_constituents_data(
+        self,
+        start: str | date | None = None,
+        end: str | date | None = None,
+    ) -> pd.DataFrame:
+        """加载 S&P 500 成分股时间表，不参与其他数据表过滤。"""
+        conditions, params = self._date_bounds("dt", start, end)
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = (
+            "SELECT symbol, dt AS date, updated_at "
+            f"FROM sp500_constituents{where} ORDER BY dt, symbol"
+        )
+        logger.debug("USStockLocalLoader.load_sp500_constituents_data query: {}", query)
+        with self._connect() as conn:
+            if not self._table_exists(conn, "sp500_constituents"):
+                logger.warning("sp500_constituents 表不存在，返回空表")
+                return pd.DataFrame()
+            df = pd.read_sql_query(query, conn, params=params)
+
+        if df.empty:
+            return pd.DataFrame()
+
+        df[Col.DATE] = pd.to_datetime(df[Col.DATE])
+        df[Col.SYMBOL] = df[Col.SYMBOL].astype(str)
+        if "updated_at" in df.columns:
+            df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce")
+        return self._set_index(df)
+
+    def load_industry_data(
+        self,
+        symbols: list[str] | None = None,
+    ) -> pd.DataFrame:
+        """加载股票行业分类静态映射表。"""
+        with self._connect() as conn:
+            if not self._table_exists(conn, "industry"):
+                logger.warning("industry 表不存在，返回空表")
+                return pd.DataFrame()
+
+            columns = self._table_columns(conn, "industry")
+            wanted = ["symbol", "name", "sector", "sub_industry", "sector_etf", "updated_at"]
+            selected = [column for column in wanted if column in columns]
+            if Col.SYMBOL not in selected:
+                logger.warning("industry 表缺少 symbol 列，返回空表")
+                return pd.DataFrame()
+
+            conditions: list[str] = []
+            params: list = []
+            if symbols:
+                placeholders = ",".join("?" * len(symbols))
+                conditions.append(f"symbol IN ({placeholders})")
+                params.extend(symbols)
+            where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+            query = f"SELECT {', '.join(selected)} FROM industry{where} ORDER BY symbol"
+            logger.debug("USStockLocalLoader.load_industry_data query: {}", query)
+            df = pd.read_sql_query(query, conn, params=params)
+
+        if df.empty:
+            return pd.DataFrame()
+
+        df[Col.SYMBOL] = df[Col.SYMBOL].astype(str)
+        if "updated_at" in df.columns:
+            df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce")
+        return df.set_index(Col.SYMBOL).sort_index()
+
     def load_data(
         self,
         symbols: list[str] | None = None,
@@ -595,4 +786,100 @@ class USStockLocalLoader(DataLoader):
             "fundamental": self.load_fundamental_data(symbols, start, end),
             "statement": self.load_statement_data(symbols, start, end),
             "macro": self.load_macro_data(start, end),
+            "sp500_constituents": self.load_sp500_constituents_data(start, end),
+            "industry": self.load_industry_data(symbols),
+        }
+
+    def load_predata(
+        self,
+        symbols: list[str] | None = None,
+        start: str | date | None = None,
+        end: str | date | None = None,
+    ) -> dict[str, pd.DataFrame]:
+        """加载 ``start`` 前一年的预热数据，不早于各表实际最早可用日期。"""
+        pre_end = self._preload_end(start)
+        if pre_end is None:
+            return {}
+
+        with self._connect() as conn:
+            market_start = self._preload_start(
+                start,
+                self._min_table_date(
+                    conn,
+                    table="market",
+                    date_expr="date(t.dt)",
+                    symbols=symbols,
+                    exclude_symbols=self._TEMPORARILY_BLOCKED_SYMBOLS,
+                ),
+            )
+            etf_start = self._preload_start(
+                start,
+                self._min_table_date(
+                    conn,
+                    table="etf",
+                    date_expr="date(t.dt)",
+                    exclude_symbols=self._TEMPORARILY_BLOCKED_SYMBOLS,
+                ),
+            )
+            fundamental_start = self._preload_start(
+                start,
+                self._min_table_date(
+                    conn,
+                    table="fundamental",
+                    date_expr="date(t.dt)",
+                    symbols=symbols,
+                    exclude_symbols=self._TEMPORARILY_BLOCKED_SYMBOLS,
+                ),
+            )
+            statement_start = self._preload_start(
+                start,
+                self._min_table_date(
+                    conn,
+                    table="statement",
+                    date_expr="date(t.filing_date, '+45 days')",
+                    symbols=symbols,
+                    exclude_symbols=self._TEMPORARILY_BLOCKED_SYMBOLS,
+                    extra_conditions=["t.filing_date IS NOT NULL"],
+                ),
+            )
+            macro_start = self._preload_start(
+                start,
+                self._min_table_date(conn, table="macro", date_expr="date(t.dt)"),
+            )
+            sp500_start = self._preload_start(
+                start,
+                self._min_table_date(conn, table="sp500_constituents", date_expr="date(t.dt)"),
+            )
+
+        return {
+            "market": (
+                self.load_market_data(symbols, market_start, pre_end)
+                if self._valid_preload_range(market_start, pre_end)
+                else pd.DataFrame()
+            ),
+            "etf": (
+                self.load_etf_market_data(None, etf_start, pre_end)
+                if self._valid_preload_range(etf_start, pre_end)
+                else pd.DataFrame()
+            ),
+            "fundamental": (
+                self.load_fundamental_data(symbols, fundamental_start, pre_end)
+                if self._valid_preload_range(fundamental_start, pre_end)
+                else pd.DataFrame()
+            ),
+            "statement": (
+                self.load_statement_data(symbols, statement_start, pre_end)
+                if self._valid_preload_range(statement_start, pre_end)
+                else pd.DataFrame()
+            ),
+            "macro": (
+                self.load_macro_data(macro_start, pre_end)
+                if self._valid_preload_range(macro_start, pre_end)
+                else pd.DataFrame()
+            ),
+            "sp500_constituents": (
+                self.load_sp500_constituents_data(sp500_start, pre_end)
+                if self._valid_preload_range(sp500_start, pre_end)
+                else pd.DataFrame()
+            )
         }

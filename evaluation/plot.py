@@ -19,21 +19,61 @@ def plot_ic_series(
     figsize: tuple = (14, 5),
     ax: plt.Axes | None = None,
 ) -> plt.Figure:
-    """IC 时间序列图 + 滚动均线。"""
+    """IC 时间序列图 + 滚动均线。
+
+    使用色带填充 + 柱状图双重表达，即使大部分 IC 值接近 0 也能清晰辨别。
+    纵轴基于 IQR 收窄，确保小信号可见。
+    """
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
     else:
         fig = ax.figure
 
-    ax.bar(ic_series.index, ic_series.values, width=0.8, alpha=0.4, color="steelblue", label="IC")
-    rolling_mean = ic_series.rolling(rolling_window).mean()
-    ax.plot(rolling_mean.index, rolling_mean.values, color="red", linewidth=1.5,
-            label=f"MA({rolling_window})")
-    ax.axhline(0, color="black", linewidth=0.5)
+    ic_clean = ic_series.dropna()
+    if ic_clean.empty:
+        ax.set_title(title)
+        return fig
+
+    # ── 色带填充：正值蓝色区域，负值红色区域 ──
+    ax.fill_between(
+        ic_clean.index, 0, ic_clean.values,
+        where=ic_clean.values >= 0,
+        color="#2c7bb6", alpha=0.35, interpolate=True, label="IC > 0",
+    )
+    ax.fill_between(
+        ic_clean.index, 0, ic_clean.values,
+        where=ic_clean.values < 0,
+        color="#d7191c", alpha=0.35, interpolate=True, label="IC < 0",
+    )
+
+    # ── 滚动均线 ──
+    rolling_mean = ic_clean.rolling(rolling_window).mean()
+    ax.plot(
+        rolling_mean.index, rolling_mean.values,
+        color="black", linewidth=1.5,
+        label=f"MA({rolling_window})",
+    )
+
+    # ── 零线 ──
+    ax.axhline(0, color="gray", linewidth=0.5, linestyle="--")
+
+    # ── 收窄纵轴：基于 IQR 而非极值，避免被少数离群点撑大 ──
+    q25, q75 = ic_clean.quantile(0.25), ic_clean.quantile(0.75)
+    iqr = q75 - q25
+    fence = 1.5 * iqr  # 标准箱线图须
+    lo_fence = q25 - fence
+    hi_fence = q75 + fence
+    # 用 fence 与实际极值中较小的那个，加上 padding
+    y_lo = min(lo_fence, ic_clean.min()) * 1.1
+    y_hi = max(hi_fence, ic_clean.max()) * 1.1
+    # 确保范围对称（视觉更舒适）
+    y_abs = max(abs(y_lo), abs(y_hi))
+    ax.set_ylim(-y_abs, y_abs)
+
     ax.set_title(title)
     ax.set_xlabel("Date")
     ax.set_ylabel("IC")
-    ax.legend()
+    ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     return fig
 

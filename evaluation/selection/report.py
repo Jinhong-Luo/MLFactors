@@ -117,6 +117,7 @@ class FactorReport:
         self._ic_series: pd.Series | None = None
         self._layered: LayeredResult | None = None
         self._summary: pd.DataFrame | None = None
+        self._rebalance_holdings: pd.DataFrame | None = None
 
     @staticmethod
     def _resolve_forward_period(rebalance: str | None) -> int:
@@ -149,6 +150,49 @@ class FactorReport:
 
     def turnover(self) -> pd.Series:
         return calc_turnover(self.factor_values)
+
+    def rebalance_holdings(self) -> pd.DataFrame:
+        """返回每次调仓的多头分组股票列表。"""
+        if self._rebalance_holdings is not None:
+            return self._rebalance_holdings
+
+        combined = pd.DataFrame({
+            "factor": self.factor_values,
+            "returns": self.fwd_returns,
+        }).dropna()
+        if combined.empty:
+            self._rebalance_holdings = pd.DataFrame(
+                columns=["date", "group", "symbol_count", "symbols"]
+            )
+            return self._rebalance_holdings
+
+        records = []
+        dates = combined.index.get_level_values(0).unique().sort_values()
+        target_group = self.n_groups
+        for dt in dates:
+            cross = combined.xs(dt, level=0).copy()
+            if len(cross) < self.n_groups:
+                continue
+
+            ranks = cross["factor"].rank(method="first")
+            groups = pd.qcut(ranks, self.n_groups, labels=False, duplicates="drop") + 1
+            selected = cross.loc[groups == target_group].sort_values("factor", ascending=False)
+            if selected.empty:
+                continue
+
+            symbols = selected.index.get_level_values(-1).astype(str).tolist()
+            records.append({
+                "date": pd.Timestamp(dt).strftime("%Y-%m-%d"),
+                "group": int(target_group),
+                "symbol_count": int(len(symbols)),
+                "symbols": ", ".join(symbols),
+            })
+
+        self._rebalance_holdings = pd.DataFrame.from_records(
+            records,
+            columns=["date", "group", "symbol_count", "symbols"],
+        )
+        return self._rebalance_holdings
 
     def ic_decay(self, max_lag: int = 20) -> pd.Series:
         return calc_ic_decay(
@@ -197,6 +241,10 @@ class FactorReport:
         ic_positive_ratio = (ic_s > 0).mean()
 
         lr = self.layered()
+        long_sharpe = 0.0
+        if not lr.sharpe_ratios.empty:
+            top_group = lr.sharpe_ratios.index.max()
+            long_sharpe = float(lr.sharpe_ratios.loc[top_group])
 
         records.append({
             "period": 1,
@@ -207,6 +255,7 @@ class FactorReport:
             "p_value": round(pval, 6),
             "IC>0_ratio": round(ic_positive_ratio, 4),
             "turnover": round(turnover_mean, 4),
+            "long_sharpe": round(long_sharpe, 4),
             "long_max_drawdown": round(lr.long_max_drawdown, 4),
             "short_max_drawdown": round(lr.short_max_drawdown, 4),
             "top_excess_annual": round(lr.top_excess_annual, 4),
