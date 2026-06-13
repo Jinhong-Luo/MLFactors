@@ -39,7 +39,6 @@ htmlcov/
 
 # Data & cache
 cache/
-*.csv
 *.parquet
 *.feather
 *.h5
